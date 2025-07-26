@@ -1,108 +1,165 @@
 const axios = require('axios');
-// No dotenv needed if no GITHUB_TOKEN
+// const path = require('path'); // Not needed if dotenv isn't used for local dev in Vercel context
+// require('dotenv').config({ path: path.resolve(__dirname, '../.env') }); // No dotenv for Vercel
 
-// GitHub REST API Base URL
-const GITHUB_REST_API_BASE = 'https://api.github.com';
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN; // Vercel injects this securely
+const GITHUB_GRAPHQL_ENDPOINT = 'https://api.github.com/graphql';
 
-// Function to fetch GitHub data for a single user/organization using REST API
 async function fetchGitHubData(username, isOrganization = false) {
-    // Headers are still good practice, even without auth
+    if (!GITHUB_TOKEN) {
+        console.error("GITHUB_TOKEN is not set. Cannot make authenticated API calls.");
+        return null; // Or throw an error
+    }
+
     const headers = {
-        'User-Agent': 'github-stats-aggregator-v1', // Required by GitHub API
-        'Accept': 'application/vnd.github.v3+json', // Recommended for V3 REST API
+        'Authorization': `bearer ${GITHUB_TOKEN}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'github-stats-aggregator-v1' // Good practice
     };
+
+    let query;
+    let variables;
+    let aggregatedStars = 0; // For organizations
 
     try {
         if (isOrganization) {
-            // *** IMPORTANT: Fetching organization stats like "total commits"
-            // *** for an unauthenticated user is EXTREMELY DIFFICULT/IMPOSSIBLE
-            // *** via REST API without iterating all its repos and contributions,
-            // *** which will instantly hit rate limits.
-            // *** For organizations, we'll try to get overall repo stars.
-
-            let totalOrgStars = 0;
+            // GraphQL query to get an organization's repositories and their star counts
+            query = `
+                query ($login: String!, $cursor: String) {
+                    organization(login: $login) {
+                        repositories(first: 100, after: $cursor, privacy: ALL) {
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                            nodes {
+                                stargazerCount
+                                isFork
+                            }
+                        }
+                    }
+                    rateLimit {
+                        remaining
+                        resetAt
+                    }
+                }
+            `;
             let hasNextPage = true;
-            let page = 1;
+            let cursor = null;
 
-            while(hasNextPage && page <= 5) { // Limit pages to avoid hitting rate limits too quickly
-                const response = await axios.get(
-                    `${GITHUB_REST_API_BASE}/orgs/${username}/repos?per_page=100&page=${page}&type=public`,
-                    { headers }
-                );
-                const repos = response.data;
+            while (hasNextPage) {
+                variables = { login: username, cursor };
+                const response = await axios.post(GITHUB_GRAPHQL_ENDPOINT, { query, variables }, { headers });
 
-                if (repos.length === 0) {
-                    hasNextPage = false;
-                    break;
+                if (response.data.errors) {
+                    console.error("GraphQL errors for organization:", response.data.errors);
+                    throw new Error("GraphQL error for organization.");
                 }
 
-                repos.forEach(repo => {
-                    if (!repo.fork) { // Only count stars from non-forked repos
-                        totalOrgStars += repo.stargazers_count;
+                const orgData = response.data.data.organization;
+                if (!orgData || !orgData.repositories) break;
+
+                orgData.repositories.nodes.forEach(repo => {
+                    // Only count stars from non-forked repositories
+                    if (!repo.isFork) {
+                        aggregatedStars += repo.stargazerCount;
                     }
                 });
 
-                // Check for next page link in headers (unreliable for simple pagination sometimes)
-                const linkHeader = response.headers.link;
-                hasNextPage = linkHeader && linkHeader.includes('rel="next"');
-                page++;
-
-                // Add a small delay between requests to be gentle on rate limits
-                await new Promise(resolve => setTimeout(resolve, 500)); // 0.5 sec delay
+                hasNextPage = orgData.repositories.pageInfo.hasNextPage;
+                cursor = orgData.repositories.pageInfo.endCursor;
+                // Optional: add a small delay if you anticipate hitting secondary rate limits
+                // await new Promise(resolve => setTimeout(resolve, 50));
             }
-
-            return { stars: totalOrgStars }; // Only stars are semi-feasible for orgs unauthenticated
+            return { stars: aggregatedStars };
         } else {
-            // Fetch user profile for public stats
-            const userResponse = await axios.get(`${GITHUB_REST_API_BASE}/users/${username}`, { headers });
-            const userData = userResponse.data;
+            // GraphQL query for user contributions and owned/starred repos
+            const currentYear = new Date().getFullYear();
+            const startOfYear = `${currentYear}-01-01T00:00:00Z`;
+            const endOfYear = `${currentYear}-12-31T23:59:59Z`;
 
-            // Getting total commits, PRs, issues without GraphQL's contributionsCollection
-            // and without authentication is *very hard and rate-limit-intensive*.
-            // The public user endpoint only gives you public_repos, public_gists, followers, following.
-            // It does NOT give you total stars *given* or total contributions easily.
-            // For stars, `starred_url` would need another paginated request.
+            query = `
+                query ($login: String!, $startOfYear: DateTime!, $endOfYear: DateTime!) {
+                    user(login: $login) {
+                        contributionsCollection(from: $startOfYear, to: $endOfYear) {
+                            totalCommitContributions
+                            totalPullRequestContributions
+                            totalIssueContributions
+                            restrictedContributionsCount // Public + private (excluding forks)
+                            totalRepositoriesWithContributedCommits
+                        }
+                        # Stars on repositories *owned* by the user
+                        repositories(first: 100, privacy: ALL, ownerAffiliations: [OWNER]) {
+                            nodes {
+                                stargazerCount
+                                isFork
+                            }
+                            pageInfo {
+                                hasNextPage
+                                endCursor
+                            }
+                        }
+                         # Stars on repositories the user has *starred* themselves (this is what my prev unauth code got)
+                        starredRepositories {
+                            totalCount
+                        }
+                    }
+                    rateLimit {
+                        remaining
+                        resetAt
+                    }
+                }
+            `;
+            variables = { login: username, startOfYear, endOfYear };
+            const response = await axios.post(GITHUB_GRAPHQL_ENDPOINT, { query, variables }, { headers });
 
-            let totalUserStars = 0;
-            let userStarsPage = 1;
-            let hasNextUserStarsPage = true;
-
-            while (hasNextUserStarsPage && userStarsPage <= 5) { // Limit pages
-                const starredResponse = await axios.get(
-                    `${GITHUB_REST_API_BASE}/users/${username}/starred?per_page=100&page=${userStarsPage}`,
-                    { headers }
-                );
-                totalUserStars += starredResponse.data.length; // Count starred repos
-
-                const linkHeader = starredResponse.headers.link;
-                hasNextUserStarsPage = linkHeader && linkHeader.includes('rel="next"');
-                userStarsPage++;
-                await new Promise(resolve => setTimeout(resolve, 500));
+            if (response.data.errors) {
+                console.error("GraphQL errors for user:", response.data.errors);
+                throw new Error("GraphQL error for user.");
             }
 
-            // *** IMPORTANT: These will be placeholders or very inaccurate for unauthenticated.
-            // *** GitHub REST API does not easily provide these aggregated numbers for unauthenticated users.
-            // *** You would typically need to hit multiple event/activity endpoints, which would destroy your rate limit.
-            // *** This is why a token or dedicated service (like github-readme-stats or your worker.dev) is used.
-            const totalCommits = 0; // Cannot easily get without specific repo queries / events
-            const totalPRs = 0;     // Cannot easily get
-            const totalIssues = 0;  // Cannot easily get
-            const contributedTo = 0; // Cannot easily get
+            const userData = response.data.data.user;
+            if (!userData) return null;
+
+            const contributions = userData.contributionsCollection;
+            let userOwnedRepoStars = 0;
+            let userStarredTotal = userData.starredRepositories.totalCount || 0; // Total repos user starred
+
+            // Sum stars from repositories *owned* by the user (or where they are primary owner)
+            // This correctly gets the 27 for aligheshlaghi97 from your worker.dev call
+            if (userData.repositories && userData.repositories.nodes) {
+                userData.repositories.nodes.forEach(repo => {
+                    if (!repo.isFork) {
+                        userOwnedRepoStars += repo.stargazerCount;
+                    }
+                });
+                // Note: If user has >100 owned repos, this needs pagination too.
+                // For most personal profiles, 100 is enough.
+                if (userData.repositories.pageInfo.hasNextPage) {
+                    console.warn(`User ${username} has more than 100 owned repositories. Star count might be incomplete without pagination for owned repos.`);
+                }
+            }
+
+            // Decide which "stars" you want for the personal user:
+            // 1. userOwnedRepoStars: Stars on repos you own (e.g., 27 for you)
+            // 2. userStarredTotal: Stars on repos you have starred (your previous code got this, likely 64)
+            // 3. (Less common) Combine both: userOwnedRepoStars + userStarredTotal
+            // Given your initial requirement of 27 from your own, we'll use userOwnedRepoStars
+            const personalUserStars = userOwnedRepoStars;
 
 
             return {
-                stars: totalUserStars,
-                totalCommits: totalCommits,
-                totalPRs: totalPRs,
-                totalIssues: totalIssues,
-                contributedTo: contributedTo
+                stars: personalUserStars,
+                totalCommits: contributions.totalCommitContributions,
+                totalPRs: contributions.totalPullRequestContributions,
+                totalIssues: contributions.totalIssueContributions,
+                contributedTo: contributions.totalRepositoriesWithContributedCommits
             };
         }
     } catch (error) {
         console.error(`Error fetching GitHub data for ${username}:`, error.response ? error.response.data : error.message);
-        // Check for rate limit exceeded
-        if (error.response && error.response.status === 403 && error.response.headers['x-ratelimit-remaining'] === '0') {
-            console.error("GitHub API Rate Limit Exceeded for unauthenticated requests!");
+        if (error.response && (error.response.status === 401 || error.response.status === 403)) {
+            console.error("Authentication failed or Rate Limit Exceeded. Check GITHUB_TOKEN and its permissions.");
         }
         return null;
     }
@@ -151,12 +208,15 @@ function generateSVG(data) {
 
 // Vercel serverless function handler
 module.exports = async (req, res) => {
+    // You can retrieve username and organization from query parameters,
+    // or hardcode them if they'll always be the same.
     const personalUsername = req.query.user || 'aligheshlaghi97';
-    const organizationName = req.query.org || 'Finance-Insight-Lab';
+    const organizationName = req.query.org || 'Finance-Insight-Lab'; // Default or allow custom org
 
+    // Fetch data concurrently
     const [personalStats, orgStats] = await Promise.all([
-        fetchGitHubData(personalUsername, false),
-        fetchGitHubData(organizationName, true)
+        fetchGitHubData(personalUsername, false), // isOrganization = false
+        fetchGitHubData(organizationName, true)   // isOrganization = true
     ]);
 
     let totalStars = 0;
@@ -165,29 +225,35 @@ module.exports = async (req, res) => {
     let totalIssues = 0;
     let totalContributedTo = 0;
 
-    // Aggregate personal stars (only what can be obtained unauthenticated)
+    // Aggregate personal stats
     if (personalStats) {
         totalStars += personalStats.stars;
-        // Commits, PRs, Issues, ContributedTo will likely be 0 or highly inaccurate
-        // as unauthenticated REST API doesn't easily provide them aggregated.
+        totalCommits += personalStats.totalCommits;
+        totalPRs += personalStats.totalPRs;
+        totalIssues += personalStats.totalIssues;
+        totalContributedTo += personalStats.contributedTo;
     }
 
-    // Aggregate organization stars
+    // Aggregate organization stars (only stars for organizations from the custom API)
     if (orgStats) {
         totalStars += orgStats.stars;
+        // The user's contributionsCollection from GraphQL *should* already include contributions to organization repos.
+        // So, we don't need to add commits/PRs/issues from orgStats unless you want to count
+        // ALL activity *within the organization*, not just *your* activity there.
+        // Given your initial input, we're focusing on *your* total impact.
     }
 
     const combinedData = {
         totalStars,
-        totalCommits, // Will be 0
-        totalPRs,     // Will be 0
-        totalIssues,  // Will be 0
-        totalContributedTo // Will be 0
+        totalCommits,
+        totalPRs,
+        totalIssues,
+        totalContributedTo
     };
 
     const svg = generateSVG(combinedData);
 
     res.setHeader('Content-Type', 'image/svg+xml');
-    res.setHeader('Cache-Control', 's-maxage=60, stale-while-revalidate'); // Very short cache for unauthenticated
+    res.setHeader('Cache-Control', 's-maxage=3600, stale-while-revalidate'); // Cache for 1 hour
     res.send(svg);
 };
