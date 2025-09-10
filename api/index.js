@@ -21,6 +21,7 @@ async function fetchStarsFromExternalAPI(username) {
 }
 
 // Function to fetch personal contributions from GitHub GraphQL API (authenticated)
+// This includes both public and private repository contributions
 async function fetchPersonalContributionsFromGitHub(username) {
     if (!GITHUB_TOKEN) {
         console.error("GITHUB_TOKEN is not set. Cannot fetch personal contributions from GitHub.");
@@ -40,7 +41,7 @@ async function fetchPersonalContributionsFromGitHub(username) {
     const query = `
         query ($login: String!, $startOfYear: DateTime!, $endOfYear: DateTime!) {
             user(login: $login) {
-                contributionsCollection(from: $startOfYear, to: $endOfYear) {
+                contributionsCollection(from: $startOfYear, to: $endOfYear, includePrivate: true) {
                     totalCommitContributions
                     totalPullRequestContributions
                     totalIssueContributions
@@ -100,9 +101,10 @@ function generateSVG(data) {
     const borderColor = '#30363d';
 
     const width = 450;
-    const height = 220; // Increased height to accommodate all lines
+    const height = 240; // Increased height to accommodate better spacing
     const padding = 20;
-    const lineHeight = 20;
+    const lineHeight = 22; // Increased line height for better spacing
+    const topMargin = 35; // Added top margin to move content down
 
     const createRow = (label, value, y, icon) => `
         <g transform="translate(${padding}, ${y})">
@@ -115,17 +117,17 @@ function generateSVG(data) {
     return `
         <svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Combined GitHub Stats">
             <rect x="0.5" y="0.5" rx="4.5" height="${height - 1}" width="${width - 1}" stroke="${borderColor}" fill="${bgColor}" stroke-opacity="1"/>
-            <g transform="translate(0, 20)">
+            <g transform="translate(0, ${topMargin})">
                 <text x="${width / 2}" y="0" fill="${textColor}" font-size="18" font-weight="bold" text-anchor="middle">
                     Combined GitHub Stats
                 </text>
             </g>
 
-            ${createRow('Total Stars', totalStars, padding + lineHeight * 2, '⭐')}
-            ${createRow('Total Commits (' + new Date().getFullYear() + ')', totalCommits, padding + lineHeight * 3.5, '📊')}
-            ${createRow('Total PRs', totalPRs, padding + lineHeight * 5, '✅')}
-            ${createRow('Total Issues', totalIssues, padding + lineHeight * 6.5, '❗')}
-            ${createRow('Contributed to', totalContributedTo, padding + lineHeight * 8, '🤝')}
+            ${createRow('Total Stars', totalStars, topMargin + lineHeight * 1.5, '⭐')}
+            ${createRow('Total Commits (' + new Date().getFullYear() + ')', totalCommits, topMargin + lineHeight * 2.8, '📊')}
+            ${createRow('Total PRs', totalPRs, topMargin + lineHeight * 4.1, '✅')}
+            ${createRow('Total Issues', totalIssues, topMargin + lineHeight * 5.4, '❗')}
+            ${createRow('Contributed to', totalContributedTo, topMargin + lineHeight * 6.7, '🤝')}
         </svg>
     `;
 }
