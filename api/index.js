@@ -77,18 +77,24 @@ async function fetchPersonalContributionsFromGitHub(username) {
     const variables = { login: username, startOfYear, endOfYear };
 
     try {
-        // Try private contributions first, fallback to public if it fails
-        let response;
-        try {
-            response = await axios.post(GITHUB_GRAPHQL_ENDPOINT, { query: privateQuery, variables }, { headers });
-        } catch (privateError) {
-            console.log("Private contributions query failed, falling back to public contributions");
-            response = await axios.post(GITHUB_GRAPHQL_ENDPOINT, { query: publicQuery, variables }, { headers });
+        // Start with public contributions (more reliable)
+        let response = await axios.post(GITHUB_GRAPHQL_ENDPOINT, { query: publicQuery, variables }, { headers });
+        
+        // If public works, try to get private data as well
+        if (response.data.data && response.data.data.user) {
+            try {
+                const privateResponse = await axios.post(GITHUB_GRAPHQL_ENDPOINT, { query: privateQuery, variables }, { headers });
+                if (privateResponse.data.data && privateResponse.data.data.user && privateResponse.data.data.user.contributionsCollection) {
+                    console.log("Successfully fetched private contributions");
+                    response = privateResponse; // Use private data if available
+                }
+            } catch (privateError) {
+                console.log("Private contributions not available, using public data only");
+            }
         }
 
         if (response.data.errors) {
             console.error("GraphQL errors for personal contributions:", response.data.errors);
-            // Log specific errors
             response.data.errors.forEach(err => console.error(err.message));
             return { totalCommits: 0, totalPRs: 0, totalIssues: 0, contributedTo: 0 };
         }
@@ -100,6 +106,13 @@ async function fetchPersonalContributionsFromGitHub(username) {
         }
 
         const contributions = userData.contributionsCollection;
+        
+        console.log(`Fetched contributions for ${username}:`, {
+            commits: contributions.totalCommitContributions,
+            prs: contributions.totalPullRequestContributions,
+            issues: contributions.totalIssueContributions,
+            contributedTo: contributions.totalRepositoriesWithContributedCommits
+        });
 
         return {
             totalCommits: contributions.totalCommitContributions,
@@ -132,12 +145,12 @@ function generateSVG(data) {
     const padding = 20;
     const lineHeight = 22;
     
-    // Calculate proper spacing for equal top and bottom margins
+    // Calculate proper spacing for equal top and bottom margins (reduced spacing)
     const titleHeight = 25; // Space for title
     const contentHeight = 5 * lineHeight; // 5 rows of content
     const totalContentHeight = titleHeight + contentHeight;
     const availableSpace = height - totalContentHeight;
-    const topMargin = Math.floor(availableSpace / 2) + 10; // Equal spacing with slight offset
+    const topMargin = Math.floor(availableSpace / 3) + 15; // Reduced spacing but still equal
 
     const createRow = (label, value, y, icon) => `
         <g transform="translate(${padding}, ${y})">
@@ -186,6 +199,8 @@ module.exports = async (req, res) => {
         totalIssues: personalContributions.totalIssues,
         totalContributedTo: personalContributions.contributedTo
     };
+
+    console.log('Final combined data:', combinedData);
 
     const svg = generateSVG(combinedData);
 
