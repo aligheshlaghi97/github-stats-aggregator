@@ -38,7 +38,26 @@ async function fetchPersonalContributionsFromGitHub(username) {
     const startOfYear = `${currentYear}-01-01T00:00:00Z`;
     const endOfYear = `${currentYear}-12-31T23:59:59Z`;
 
-    const query = `
+    // First try to get public contributions
+    const publicQuery = `
+        query ($login: String!, $startOfYear: DateTime!, $endOfYear: DateTime!) {
+            user(login: $login) {
+                contributionsCollection(from: $startOfYear, to: $endOfYear) {
+                    totalCommitContributions
+                    totalPullRequestContributions
+                    totalIssueContributions
+                    totalRepositoriesWithContributedCommits
+                }
+            }
+            rateLimit {
+                remaining
+                resetAt
+            }
+        }
+    `;
+
+    // Then try to get private contributions
+    const privateQuery = `
         query ($login: String!, $startOfYear: DateTime!, $endOfYear: DateTime!) {
             user(login: $login) {
                 contributionsCollection(from: $startOfYear, to: $endOfYear, includePrivate: true) {
@@ -54,10 +73,18 @@ async function fetchPersonalContributionsFromGitHub(username) {
             }
         }
     `;
+
     const variables = { login: username, startOfYear, endOfYear };
 
     try {
-        const response = await axios.post(GITHUB_GRAPHQL_ENDPOINT, { query, variables }, { headers });
+        // Try private contributions first, fallback to public if it fails
+        let response;
+        try {
+            response = await axios.post(GITHUB_GRAPHQL_ENDPOINT, { query: privateQuery, variables }, { headers });
+        } catch (privateError) {
+            console.log("Private contributions query failed, falling back to public contributions");
+            response = await axios.post(GITHUB_GRAPHQL_ENDPOINT, { query: publicQuery, variables }, { headers });
+        }
 
         if (response.data.errors) {
             console.error("GraphQL errors for personal contributions:", response.data.errors);
@@ -101,10 +128,16 @@ function generateSVG(data) {
     const borderColor = '#30363d';
 
     const width = 450;
-    const height = 240; // Increased height to accommodate better spacing
+    const height = 240;
     const padding = 20;
-    const lineHeight = 22; // Increased line height for better spacing
-    const topMargin = 35; // Added top margin to move content down
+    const lineHeight = 22;
+    
+    // Calculate proper spacing for equal top and bottom margins
+    const titleHeight = 25; // Space for title
+    const contentHeight = 5 * lineHeight; // 5 rows of content
+    const totalContentHeight = titleHeight + contentHeight;
+    const availableSpace = height - totalContentHeight;
+    const topMargin = Math.floor(availableSpace / 2) + 10; // Equal spacing with slight offset
 
     const createRow = (label, value, y, icon) => `
         <g transform="translate(${padding}, ${y})">
@@ -123,11 +156,11 @@ function generateSVG(data) {
                 </text>
             </g>
 
-            ${createRow('Total Stars', totalStars, topMargin + lineHeight * 1.5, '⭐')}
-            ${createRow('Total Commits (' + new Date().getFullYear() + ')', totalCommits, topMargin + lineHeight * 2.8, '📊')}
-            ${createRow('Total PRs', totalPRs, topMargin + lineHeight * 4.1, '✅')}
-            ${createRow('Total Issues', totalIssues, topMargin + lineHeight * 5.4, '❗')}
-            ${createRow('Contributed to', totalContributedTo, topMargin + lineHeight * 6.7, '🤝')}
+            ${createRow('Total Stars', totalStars, topMargin + titleHeight + lineHeight * 0.5, '⭐')}
+            ${createRow('Total Commits (' + new Date().getFullYear() + ')', totalCommits, topMargin + titleHeight + lineHeight * 1.5, '📊')}
+            ${createRow('Total PRs', totalPRs, topMargin + titleHeight + lineHeight * 2.5, '✅')}
+            ${createRow('Total Issues', totalIssues, topMargin + titleHeight + lineHeight * 3.5, '❗')}
+            ${createRow('Contributed to', totalContributedTo, topMargin + titleHeight + lineHeight * 4.5, '🤝')}
         </svg>
     `;
 }
