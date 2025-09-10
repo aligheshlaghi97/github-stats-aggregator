@@ -77,19 +77,30 @@ async function fetchPersonalContributionsFromGitHub(username) {
     const variables = { login: username, startOfYear, endOfYear };
 
     try {
-        // Start with public contributions (more reliable)
-        let response = await axios.post(GITHUB_GRAPHQL_ENDPOINT, { query: publicQuery, variables }, { headers });
+        // Try private contributions first (this is what we want)
+        let response;
+        let isPrivateData = false;
         
-        // If public works, try to get private data as well
-        if (response.data.data && response.data.data.user) {
+        try {
+            console.log("Attempting to fetch private contributions...");
+            response = await axios.post(GITHUB_GRAPHQL_ENDPOINT, { query: privateQuery, variables }, { headers });
+            
+            if (response.data.data && response.data.data.user && response.data.data.user.contributionsCollection) {
+                console.log("Successfully fetched private contributions!");
+                isPrivateData = true;
+            } else {
+                throw new Error("Private data not available");
+            }
+        } catch (privateError) {
+            console.log("Private contributions failed, trying public contributions...");
+            console.log("Private error:", privateError.message);
+            
             try {
-                const privateResponse = await axios.post(GITHUB_GRAPHQL_ENDPOINT, { query: privateQuery, variables }, { headers });
-                if (privateResponse.data.data && privateResponse.data.data.user && privateResponse.data.data.user.contributionsCollection) {
-                    console.log("Successfully fetched private contributions");
-                    response = privateResponse; // Use private data if available
-                }
-            } catch (privateError) {
-                console.log("Private contributions not available, using public data only");
+                response = await axios.post(GITHUB_GRAPHQL_ENDPOINT, { query: publicQuery, variables }, { headers });
+                console.log("Fetched public contributions as fallback");
+            } catch (publicError) {
+                console.error("Both private and public queries failed:", publicError.message);
+                throw publicError;
             }
         }
 
@@ -107,7 +118,7 @@ async function fetchPersonalContributionsFromGitHub(username) {
 
         const contributions = userData.contributionsCollection;
         
-        console.log(`Fetched contributions for ${username}:`, {
+        console.log(`Fetched ${isPrivateData ? 'PRIVATE' : 'PUBLIC'} contributions for ${username}:`, {
             commits: contributions.totalCommitContributions,
             prs: contributions.totalPullRequestContributions,
             issues: contributions.totalIssueContributions,
@@ -145,12 +156,12 @@ function generateSVG(data) {
     const padding = 20;
     const lineHeight = 22;
     
-    // Calculate proper spacing for equal top and bottom margins (reduced spacing)
+    // Calculate proper spacing for equal top and bottom margins (half the current spacing)
     const titleHeight = 25; // Space for title
     const contentHeight = 5 * lineHeight; // 5 rows of content
     const totalContentHeight = titleHeight + contentHeight;
     const availableSpace = height - totalContentHeight;
-    const topMargin = Math.floor(availableSpace / 3) + 15; // Reduced spacing but still equal
+    const topMargin = Math.floor(availableSpace / 6) + 8; // Half the previous spacing but still equal
 
     const createRow = (label, value, y, icon) => `
         <g transform="translate(${padding}, ${y})">
