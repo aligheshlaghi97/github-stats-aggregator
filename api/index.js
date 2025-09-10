@@ -156,12 +156,12 @@ function generateSVG(data) {
     const padding = 20;
     const lineHeight = 22;
     
-    // Calculate proper spacing for equal top and bottom margins (half the current spacing)
+    // Calculate proper spacing for equal top and bottom margins
     const titleHeight = 25; // Space for title
     const contentHeight = 5 * lineHeight; // 5 rows of content
     const totalContentHeight = titleHeight + contentHeight;
     const availableSpace = height - totalContentHeight;
-    const topMargin = Math.floor(availableSpace / 6) + 8; // Half the previous spacing but still equal
+    const topMargin = Math.floor(availableSpace / 2); // Truly equal spacing
 
     const createRow = (label, value, y, icon) => `
         <g transform="translate(${padding}, ${y})">
@@ -191,8 +191,22 @@ function generateSVG(data) {
 
 // Vercel serverless function handler
 module.exports = async (req, res) => {
+    // Add a test endpoint for debugging
+    if (req.query.test === 'true') {
+        res.setHeader('Content-Type', 'application/json');
+        res.json({
+            message: 'Test endpoint working',
+            timestamp: new Date().toISOString(),
+            githubToken: GITHUB_TOKEN ? 'Set' : 'Not set',
+            query: req.query
+        });
+        return;
+    }
+
     const personalUsername = req.query.user || 'aligheshlaghi97';
     const organizationName = req.query.org || 'Finance-Insight-Lab';
+
+    console.log(`Fetching data for user: ${personalUsername}, org: ${organizationName}`);
 
     // Fetch data concurrently
     const [personalStars, orgStars, personalContributions] = await Promise.all([
