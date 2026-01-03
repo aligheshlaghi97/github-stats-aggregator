@@ -6,30 +6,75 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_GRAPHQL_ENDPOINT = "https://api.github.com/graphql";
 
 // In-memory storage for highest total stars (keyed by username+org combination)
-// In production, consider using a database or Redis for persistence across deployments
 const highestStarsCache = {};
 
-// Function to fetch stars from github-star-counter.workers.dev (unauthenticated from your side)
-async function fetchStarsFromExternalAPI(username) {
-  try {
-    const response = await axios.get(
-      `https://api.github-star-counter.workers.dev/user/${username}`
-    );
-    if (response.data && typeof response.data.stars === "number") {
-      return response.data.stars;
+// Initialize cache from environment variables if available
+// Format: HIGHEST_STARS_{username}_{org}=value
+function initializeCacheFromEnv() {
+  Object.keys(process.env).forEach((key) => {
+    if (key.startsWith("HIGHEST_STARS_")) {
+      const cacheKey = key.replace("HIGHEST_STARS_", "");
+      const value = parseInt(process.env[key], 10);
+      if (!isNaN(value) && value > 0) {
+        highestStarsCache[cacheKey] = value;
+        console.log(`📦 Initialized cache from env: ${cacheKey} = ${value}`);
+      }
     }
-    console.warn(
-      `Could not get stars for ${username} from external API:`,
-      response.data
-    );
-    return 0;
-  } catch (error) {
-    console.error(
-      `Error fetching stars for ${username} from external API:`,
-      error.message
-    );
-    return 0;
+  });
+}
+
+// Initialize on module load
+initializeCacheFromEnv();
+
+// Function to fetch stars from github-star-counter.workers.dev (unauthenticated from your side)
+// Added retry logic to handle transient failures
+async function fetchStarsFromExternalAPI(username, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await axios.get(
+        `https://api.github-star-counter.workers.dev/user/${username}`,
+        { timeout: 10000 } // 10 second timeout
+      );
+      if (response.data && typeof response.data.stars === "number" && response.data.stars > 0) {
+        console.log(`Successfully fetched stars for ${username}: ${response.data.stars} (attempt ${attempt})`);
+        return response.data.stars;
+      }
+      // If we get a response but stars is 0 or invalid, log it but don't retry immediately
+      if (response.data && typeof response.data.stars === "number" && response.data.stars === 0) {
+        console.warn(
+          `API returned zero stars for ${username} (attempt ${attempt}). This might be valid or an error.`
+        );
+        // Only return 0 if this is the last attempt
+        if (attempt === retries) {
+          return 0;
+        }
+        // Wait a bit before retrying
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        continue;
+      }
+      console.warn(
+        `Invalid response format for ${username} from external API (attempt ${attempt}):`,
+        response.data
+      );
+      if (attempt < retries) {
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        continue;
+      }
+      return 0;
+    } catch (error) {
+      console.error(
+        `Error fetching stars for ${username} from external API (attempt ${attempt}/${retries}):`,
+        error.message
+      );
+      if (attempt < retries) {
+        // Exponential backoff: wait longer between retries
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+        continue;
+      }
+      return 0;
+    }
   }
+  return 0;
 }
 
 // Function to fetch personal contributions from GitHub GraphQL API (authenticated)
@@ -311,35 +356,52 @@ module.exports = async (req, res) => {
   const highestStoredStars = highestStarsCache[cacheKey] || 0;
 
   // Determine which value to use and update cache
+  // Always prefer stored value if calculated is zero or lower (API issues)
   let totalStars;
+  let shouldCache = false; // Flag to prevent caching zero responses
+  
   if (calculatedTotalStars > highestStoredStars) {
     // New highest value found, update cache and use it
     highestStarsCache[cacheKey] = calculatedTotalStars;
     totalStars = calculatedTotalStars;
+    shouldCache = true;
     console.log(
-      `Updated highest stars cache for ${cacheKey}: ${calculatedTotalStars}`
+      `✅ Updated highest stars cache for ${cacheKey}: ${calculatedTotalStars}`
     );
-  } else if (calculatedTotalStars === 0 && highestStoredStars > 0) {
-    // API returned zero (likely an error), use stored value
-    totalStars = highestStoredStars;
-    console.log(
-      `API returned zero stars, using stored highest value: ${highestStoredStars}`
-    );
-  } else if (
-    calculatedTotalStars < highestStoredStars &&
-    calculatedTotalStars > 0
-  ) {
+  } else if (calculatedTotalStars === 0) {
+    // API returned zero - this is likely an error
+    if (highestStoredStars > 0) {
+      // Use stored value and don't cache this zero response
+      totalStars = highestStoredStars;
+      shouldCache = false; // Don't cache zero responses
+      console.log(
+        `⚠️ API returned zero stars, using stored highest value: ${highestStoredStars} (NOT caching zero)`
+      );
+    } else {
+      // Both are zero - might be first time or real zero
+      totalStars = 0;
+      shouldCache = false; // Don't cache zero responses
+      console.log(
+        `⚠️ No stars found and no cached value. Returning zero but NOT caching.`
+      );
+    }
+  } else if (calculatedTotalStars < highestStoredStars) {
     // Calculated value is lower than stored (possible API issue), use stored value
     totalStars = highestStoredStars;
+    shouldCache = false; // Don't cache lower values
     console.log(
-      `Using stored highest stars (${highestStoredStars}) instead of calculated (${calculatedTotalStars})`
+      `⚠️ Using stored highest stars (${highestStoredStars}) instead of calculated (${calculatedTotalStars}) - possible API issue`
     );
   } else {
-    // Use calculated value (either it's equal to stored or both are zero)
+    // Use calculated value (equal to stored)
     totalStars = calculatedTotalStars;
+    shouldCache = true;
     if (calculatedTotalStars > 0 && highestStoredStars === 0) {
       // First time seeing a valid value, store it
       highestStarsCache[cacheKey] = calculatedTotalStars;
+      console.log(
+        `✅ First valid value stored for ${cacheKey}: ${calculatedTotalStars}`
+      );
     }
   }
 
@@ -356,6 +418,20 @@ module.exports = async (req, res) => {
   const svg = generateSVG(combinedData);
 
   res.setHeader("Content-Type", "image/svg+xml");
-  res.setHeader("Cache-Control", "s-maxage=3600, stale-while-revalidate"); // Cache for 1 hour
+  
+  // Prevent caching zero responses - they're likely errors
+  // Only cache if we have valid data (totalStars > 0)
+  if (totalStars === 0 || !shouldCache) {
+    // Don't cache zero or invalid responses
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    console.log("⚠️ Response contains zero/invalid stars - NOT caching response");
+  } else {
+    // Cache valid responses for 1 hour
+    res.setHeader("Cache-Control", "s-maxage=3600, stale-while-revalidate");
+    console.log("✅ Valid response - caching for 1 hour");
+  }
+  
   res.send(svg);
 };
