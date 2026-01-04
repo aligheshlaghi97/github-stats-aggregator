@@ -5,7 +5,28 @@ const axios = require("axios");
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_GRAPHQL_ENDPOINT = "https://api.github.com/graphql";
 
-// In-memory storage for highest total stars (keyed by username+org combination)
+// Persistent cache for highest total stars (keyed by username+org combination)
+// Uses Vercel KV if available, falls back to environment variables, then in-memory
+let kvClient = null;
+
+// Try to initialize Vercel KV (optional - graceful fallback if not configured)
+try {
+  // Only try to require if KV_URL is set (Vercel automatically sets this)
+  if (process.env.KV_URL || process.env.KV_REST_API_URL) {
+    try {
+      const { kv } = require("@vercel/kv");
+      kvClient = kv;
+      console.log("✅ Vercel KV initialized for persistent cache");
+    } catch (requireError) {
+      // Package not installed or other require error
+      console.log("ℹ️ @vercel/kv package not installed, using fallback storage");
+    }
+  }
+} catch (error) {
+  console.log("ℹ️ Vercel KV not configured, using fallback storage");
+}
+
+// In-memory fallback cache (resets on cold starts)
 const highestStarsCache = {};
 
 // Initialize cache from environment variables if available
@@ -25,6 +46,61 @@ function initializeCacheFromEnv() {
 
 // Initialize on module load
 initializeCacheFromEnv();
+
+// Persistent cache functions
+async function getCachedStars(cacheKey) {
+  // Try Vercel KV first
+  if (kvClient) {
+    try {
+      const value = await kvClient.get(`stars:${cacheKey}`);
+      if (value !== null && typeof value === "number" && value > 0) {
+        console.log(`📥 Retrieved from KV cache: ${cacheKey} = ${value}`);
+        // Also update in-memory cache for faster access
+        highestStarsCache[cacheKey] = value;
+        return value;
+      }
+    } catch (error) {
+      console.warn(`⚠️ KV read error for ${cacheKey}:`, error.message);
+    }
+  }
+  
+  // Fallback to in-memory cache
+  const inMemoryValue = highestStarsCache[cacheKey];
+  if (inMemoryValue && inMemoryValue > 0) {
+    return inMemoryValue;
+  }
+  
+  // Fallback to environment variables (check on each request)
+  const envKey = `HIGHEST_STARS_${cacheKey}`;
+  const envValue = parseInt(process.env[envKey], 10);
+  if (!isNaN(envValue) && envValue > 0) {
+    highestStarsCache[cacheKey] = envValue;
+    return envValue;
+  }
+  
+  return 0;
+}
+
+async function setCachedStars(cacheKey, value) {
+  if (value <= 0) {
+    return; // Don't cache zero or negative values
+  }
+  
+  // Update in-memory cache
+  highestStarsCache[cacheKey] = value;
+  
+  // Try to persist to Vercel KV
+  if (kvClient) {
+    try {
+      await kvClient.set(`stars:${cacheKey}`, value);
+      // Set expiration to 90 days (long enough to persist across long periods)
+      await kvClient.expire(`stars:${cacheKey}`, 90 * 24 * 60 * 60);
+      console.log(`💾 Saved to KV cache: ${cacheKey} = ${value}`);
+    } catch (error) {
+      console.warn(`⚠️ KV write error for ${cacheKey}:`, error.message);
+    }
+  }
+}
 
 // Function to fetch stars from github-star-counter.workers.dev (unauthenticated from your side)
 // Added retry logic to handle transient failures
@@ -352,8 +428,8 @@ module.exports = async (req, res) => {
   // Create a cache key for this user+org combination
   const cacheKey = `${personalUsername}_${organizationName}`;
 
-  // Get the highest stored value (or 0 if not exists)
-  const highestStoredStars = highestStarsCache[cacheKey] || 0;
+  // Get the highest stored value from persistent cache (or 0 if not exists)
+  const highestStoredStars = await getCachedStars(cacheKey);
 
   // Determine which value to use and update cache
   // Always prefer stored value if calculated is zero or lower (API issues)
@@ -361,8 +437,8 @@ module.exports = async (req, res) => {
   let shouldCache = false; // Flag to prevent caching zero responses
   
   if (calculatedTotalStars > highestStoredStars) {
-    // New highest value found, update cache and use it
-    highestStarsCache[cacheKey] = calculatedTotalStars;
+    // New highest value found, update persistent cache and use it
+    await setCachedStars(cacheKey, calculatedTotalStars);
     totalStars = calculatedTotalStars;
     shouldCache = true;
     console.log(
@@ -397,8 +473,8 @@ module.exports = async (req, res) => {
     totalStars = calculatedTotalStars;
     shouldCache = true;
     if (calculatedTotalStars > 0 && highestStoredStars === 0) {
-      // First time seeing a valid value, store it
-      highestStarsCache[cacheKey] = calculatedTotalStars;
+      // First time seeing a valid value, store it persistently
+      await setCachedStars(cacheKey, calculatedTotalStars);
       console.log(
         `✅ First valid value stored for ${cacheKey}: ${calculatedTotalStars}`
       );
