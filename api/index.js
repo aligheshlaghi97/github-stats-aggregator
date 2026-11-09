@@ -1,33 +1,51 @@
 const axios = require("axios");
+const { createClient } = require("redis");
 
 // IMPORTANT: This GITHUB_TOKEN will be provided by Vercel's environment variables.
 // It will NOT be committed to your Git repository.
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const GITHUB_GRAPHQL_ENDPOINT = "https://api.github.com/graphql";
 
-// Persistent cache for highest total stars (keyed by username+org combination)
-// Uses Vercel KV if available, falls back to environment variables, then in-memory
-let kvClient = null;
-
-// Try to initialize Vercel KV (optional - graceful fallback if not configured)
-try {
-  // Only try to require if KV_URL is set (Vercel automatically sets this)
-  if (process.env.KV_URL || process.env.KV_REST_API_URL) {
-    try {
-      const { kv } = require("@vercel/kv");
-      kvClient = kv;
-      console.log("✅ Vercel KV initialized for persistent cache");
-    } catch (requireError) {
-      // Package not installed or other require error
-      console.log("ℹ️ @vercel/kv package not installed, using fallback storage");
-    }
-  }
-} catch (error) {
-  console.log("ℹ️ Vercel KV not configured, using fallback storage");
-}
-
-// In-memory fallback cache (resets on cold starts)
+// In-memory cache for this running instance. Redis keeps the same number for 90 days.
 const highestStarsCache = {};
+const STAR_CACHE_TTL_SECONDS = 90 * 24 * 60 * 60;
+const STAR_FETCH_TIMEOUT_MS = 2500;
+
+let redisClient = null;
+let redisConnecting = null;
+
+// Vercel injects REDIS_URL when the Redis database is connected to the project.
+async function getRedisClient() {
+  if (!process.env.REDIS_URL) return null;
+  if (redisClient && redisClient.isOpen) return redisClient;
+  if (redisConnecting) return redisConnecting;
+
+  const client = createClient({
+    url: process.env.REDIS_URL,
+    socket: { connectTimeout: 2000 },
+    disableOfflineQueue: true,
+  });
+  client.on("error", (error) => {
+    console.warn("Redis error:", error.message);
+  });
+
+  redisConnecting = client
+    .connect()
+    .then(() => {
+      redisClient = client;
+      console.log("Redis connected");
+      return client;
+    })
+    .catch((error) => {
+      console.warn("Redis connection failed:", error.message);
+      return null;
+    })
+    .finally(() => {
+      redisConnecting = null;
+    });
+
+  return redisConnecting;
+}
 
 // Initialize cache from environment variables if available
 // Format: HIGHEST_STARS_{username}_{org}=value
@@ -47,110 +65,136 @@ function initializeCacheFromEnv() {
 // Initialize on module load
 initializeCacheFromEnv();
 
-// Persistent cache functions
+function parseStars(value) {
+  const n = typeof value === "number" ? value : parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+// The number we keep is the higher of memory and Redis. A lower read never replaces it.
 async function getCachedStars(cacheKey) {
-  // Try Vercel KV first
-  if (kvClient) {
+  let best = parseStars(highestStarsCache[cacheKey]);
+  const redis = await getRedisClient();
+
+  if (redis) {
     try {
-      const value = await kvClient.get(`stars:${cacheKey}`);
-      if (value !== null && typeof value === "number" && value > 0) {
-        console.log(`📥 Retrieved from KV cache: ${cacheKey} = ${value}`);
-        // Also update in-memory cache for faster access
-        highestStarsCache[cacheKey] = value;
-        return value;
-      }
+      const stored = parseStars(await redis.get(`stars:${cacheKey}`));
+      if (stored > best) best = stored;
     } catch (error) {
-      console.warn(`⚠️ KV read error for ${cacheKey}:`, error.message);
+      console.warn(`Redis read error for ${cacheKey}:`, error.message);
     }
   }
-  
-  // Fallback to in-memory cache
-  const inMemoryValue = highestStarsCache[cacheKey];
-  if (inMemoryValue && inMemoryValue > 0) {
-    return inMemoryValue;
-  }
-  
-  // Fallback to environment variables (check on each request)
-  const envKey = `HIGHEST_STARS_${cacheKey}`;
-  const envValue = parseInt(process.env[envKey], 10);
-  if (!isNaN(envValue) && envValue > 0) {
-    highestStarsCache[cacheKey] = envValue;
-    return envValue;
-  }
-  
-  return 0;
+
+  best = Math.max(best, parseStars(process.env[`HIGHEST_STARS_${cacheKey}`]));
+  if (best > 0) highestStarsCache[cacheKey] = best;
+  return best;
 }
 
 async function setCachedStars(cacheKey, value) {
-  if (value <= 0) {
-    return; // Don't cache zero or negative values
-  }
-  
-  // Update in-memory cache
+  const current = Math.max(
+    parseStars(highestStarsCache[cacheKey]),
+    await getCachedStars(cacheKey)
+  );
+  if (!(value > current)) return current;
+
   highestStarsCache[cacheKey] = value;
-  
-  // Try to persist to Vercel KV
-  if (kvClient) {
-    try {
-      await kvClient.set(`stars:${cacheKey}`, value);
-      // Set expiration to 90 days (long enough to persist across long periods)
-      await kvClient.expire(`stars:${cacheKey}`, 90 * 24 * 60 * 60);
-      console.log(`💾 Saved to KV cache: ${cacheKey} = ${value}`);
-    } catch (error) {
-      console.warn(`⚠️ KV write error for ${cacheKey}:`, error.message);
+  const redis = await getRedisClient();
+  if (!redis) return value;
+
+  try {
+    await redis.set(`stars:${cacheKey}`, String(value), { EX: STAR_CACHE_TTL_SECONDS });
+    console.log(`Saved star total in Redis for 90 days: ${cacheKey} = ${value}`);
+  } catch (error) {
+    console.warn(`Redis write error for ${cacheKey}:`, error.message);
+  }
+  return value;
+}
+
+// Count public stars from GitHub itself.
+// Returns null when the request fails, so a failure is not treated as zero stars.
+async function countPublicStars(username, token) {
+  const headers = {
+    Accept: "application/vnd.github+json",
+    "User-Agent": "github-stats-aggregator-v1",
+  };
+  if (token) headers.Authorization = `bearer ${token}`;
+
+  let total = 0;
+  for (let page = 1; page <= 2; page++) {
+      const response = await axios.get(
+        `https://api.github.com/users/${encodeURIComponent(username)}/repos`,
+        {
+          headers,
+          timeout: STAR_FETCH_TIMEOUT_MS,
+          params: { per_page: 100, page, type: "owner" },
+        }
+      );
+    const repos = response.data;
+    if (!Array.isArray(repos)) return null;
+
+    for (const repo of repos) {
+      if (!repo || repo.private) continue;
+      total += Number(repo.stargazers_count) || 0;
     }
+    if (repos.length < 100) return total;
+  }
+  return total;
+}
+
+async function fetchStarsFromGitHub(username) {
+  try {
+    const total = await countPublicStars(username, GITHUB_TOKEN);
+    if (total !== null) return total;
+  } catch (error) {
+    console.error(
+      `GitHub star count failed for ${username}:`,
+      error.response ? error.response.status : error.message
+    );
+  }
+
+  if (!GITHUB_TOKEN) return null;
+  try {
+    return await countPublicStars(username, null);
+  } catch (error) {
+    console.error(
+      `Public GitHub star count failed for ${username}:`,
+      error.response ? error.response.status : error.message
+    );
+    return null;
   }
 }
 
-// Function to fetch stars from github-star-counter.workers.dev (unauthenticated from your side)
-// Added retry logic to handle transient failures
-async function fetchStarsFromExternalAPI(username, retries = 3) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const response = await axios.get(
-        `https://api.github-star-counter.workers.dev/user/${username}`,
-        { timeout: 10000 } // 10 second timeout
-      );
-      if (response.data && typeof response.data.stars === "number" && response.data.stars > 0) {
-        console.log(`Successfully fetched stars for ${username}: ${response.data.stars} (attempt ${attempt})`);
-        return response.data.stars;
-      }
-      // If we get a response but stars is 0 or invalid, log it but don't retry immediately
-      if (response.data && typeof response.data.stars === "number" && response.data.stars === 0) {
-        console.warn(
-          `API returned zero stars for ${username} (attempt ${attempt}). This might be valid or an error.`
-        );
-        // Only return 0 if this is the last attempt
-        if (attempt === retries) {
-          return 0;
-        }
-        // Wait a bit before retrying
-        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
-        continue;
-      }
-      console.warn(
-        `Invalid response format for ${username} from external API (attempt ${attempt}):`,
-        response.data
-      );
-      if (attempt < retries) {
-        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
-        continue;
-      }
-      return 0;
-    } catch (error) {
-      console.error(
-        `Error fetching stars for ${username} from external API (attempt ${attempt}/${retries}):`,
-        error.message
-      );
-      if (attempt < retries) {
-        // Exponential backoff: wait longer between retries
-        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
-        continue;
-      }
-      return 0;
-    }
+// The external counter often answers 0 when it is rate-limited, so only a positive count is usable.
+async function fetchStarsFromExternalAPI(username) {
+  try {
+    const response = await axios.get(
+      `https://api.github-star-counter.workers.dev/user/${encodeURIComponent(username)}`,
+      { timeout: STAR_FETCH_TIMEOUT_MS }
+    );
+    const stars = response.data && response.data.stars;
+    if (typeof stars === "number" && stars > 0) return stars;
+    return null;
+  } catch (error) {
+    console.error(`External star count failed for ${username}:`, error.message);
+    return null;
   }
-  return 0;
+}
+
+// Ask both sources at once. A failed source is ignored. The higher real count wins.
+async function fetchBestStars(username) {
+  const [externalStars, githubStars] = await Promise.all([
+    fetchStarsFromExternalAPI(username),
+    fetchStarsFromGitHub(username),
+  ]);
+  const found = [externalStars, githubStars].filter((value) => typeof value === "number");
+  if (found.length === 0) {
+    console.warn(`No star count for ${username}`);
+    return null;
+  }
+  const best = Math.max(...found);
+  console.log(
+    `Stars for ${username}: external ${externalStars}, github ${githubStars}, using ${best}`
+  );
+  return best;
 }
 
 // Function to fetch personal contributions from GitHub GraphQL API (authenticated)
@@ -418,67 +462,32 @@ module.exports = async (req, res) => {
 
   // Fetch data concurrently
   const [personalStars, orgStars, personalContributions] = await Promise.all([
-    fetchStarsFromExternalAPI(personalUsername),
-    fetchStarsFromExternalAPI(organizationName),
+    fetchBestStars(personalUsername),
+    fetchBestStars(organizationName),
     fetchPersonalContributionsFromGitHub(personalUsername), // Only fetch personal for GraphQL contribution stats
   ]);
 
-  const calculatedTotalStars = personalStars + orgStars;
-
-  // Create a cache key for this user+org combination
   const cacheKey = `${personalUsername}_${organizationName}`;
+  const cachedStars = await getCachedStars(cacheKey);
 
-  // Get the highest stored value from persistent cache (or 0 if not exists)
-  const highestStoredStars = await getCachedStars(cacheKey);
-
-  // Determine which value to use and update cache
-  // Always prefer stored value if calculated is zero or lower (API issues)
-  let totalStars;
-  let shouldCache = false; // Flag to prevent caching zero responses
-  
-  if (calculatedTotalStars > highestStoredStars) {
-    // New highest value found, update persistent cache and use it
-    await setCachedStars(cacheKey, calculatedTotalStars);
-    totalStars = calculatedTotalStars;
-    shouldCache = true;
-    console.log(
-      `✅ Updated highest stars cache for ${cacheKey}: ${calculatedTotalStars}`
-    );
-  } else if (calculatedTotalStars === 0) {
-    // API returned zero - this is likely an error
-    if (highestStoredStars > 0) {
-      // Use stored value and don't cache this zero response
-      totalStars = highestStoredStars;
-      shouldCache = false; // Don't cache zero responses
-      console.log(
-        `⚠️ API returned zero stars, using stored highest value: ${highestStoredStars} (NOT caching zero)`
-      );
+  // Only a complete read (personal and org) can raise the saved total.
+  // A missing side used to be added as zero and then saved for the next visits.
+  let totalStars = cachedStars;
+  if (personalStars !== null && orgStars !== null) {
+    const fetchedStars = personalStars + orgStars;
+    if (fetchedStars > cachedStars) {
+      await setCachedStars(cacheKey, fetchedStars);
+      totalStars = fetchedStars;
+      console.log(`✅ Raised cached stars for ${cacheKey}: ${fetchedStars}`);
     } else {
-      // Both are zero - might be first time or real zero
-      totalStars = 0;
-      shouldCache = false; // Don't cache zero responses
       console.log(
-        `⚠️ No stars found and no cached value. Returning zero but NOT caching.`
+        `Using cached stars for ${cacheKey}: ${cachedStars} (fetched ${fetchedStars})`
       );
     }
-  } else if (calculatedTotalStars < highestStoredStars) {
-    // Calculated value is lower than stored (possible API issue), use stored value
-    totalStars = highestStoredStars;
-    shouldCache = false; // Don't cache lower values
-    console.log(
-      `⚠️ Using stored highest stars (${highestStoredStars}) instead of calculated (${calculatedTotalStars}) - possible API issue`
-    );
   } else {
-    // Use calculated value (equal to stored)
-    totalStars = calculatedTotalStars;
-    shouldCache = true;
-    if (calculatedTotalStars > 0 && highestStoredStars === 0) {
-      // First time seeing a valid value, store it persistently
-      await setCachedStars(cacheKey, calculatedTotalStars);
-      console.log(
-        `✅ First valid value stored for ${cacheKey}: ${calculatedTotalStars}`
-      );
-    }
+    console.log(
+      `Incomplete star read for ${cacheKey}. Using cached total: ${cachedStars}`
+    );
   }
 
   const combinedData = {
@@ -497,7 +506,7 @@ module.exports = async (req, res) => {
   
   // Prevent caching zero responses - they're likely errors
   // Only cache if we have valid data (totalStars > 0)
-  if (totalStars === 0 || !shouldCache) {
+  if (totalStars === 0) {
     // Don't cache zero or invalid responses
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     res.setHeader("Pragma", "no-cache");
