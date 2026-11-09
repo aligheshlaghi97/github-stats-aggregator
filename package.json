@@ -12,8 +12,8 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@vercel/kv": "^1.0.0",
     "axios": "^1.11.0",
+    "redis": "^5.8.2",
     "dotenv": "^17.2.1",
     "express": "^5.1.0"
   }
